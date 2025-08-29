@@ -1,0 +1,18 @@
+{
+    "name": "vendor/acss",
+    "autoload": {
+        "psr-4": {
+            "Vendor\\Acss\\": "src/"
+        }
+    },
+    "require": {
+        "vlucas/phpdotenv": "^5.6",
+        "setasign/fpdi-tcpdf": "^2.3",
+        "phpoffice/phpspreadsheet": "^4.2",
+        "phpmailer/phpmailer": "^6.10",
+        "symfony/polyfill-ctype": "*",
+        "symfony/polyfill-php80": "^1.33",
+        "symfony/polyfill-mbstring": "^1.33",
+        "phpoption/phpoption": "^1.9"
+    }
+}
