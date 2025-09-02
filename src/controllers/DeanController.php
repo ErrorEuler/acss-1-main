@@ -161,6 +161,9 @@ class DeanController
         require_once __DIR__ . '/../views/dean/dashboard.php';
     }
 
+
+
+
     private function getDepartmentActivities($collegeId)
     {
         try {

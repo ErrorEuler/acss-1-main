@@ -15,6 +15,7 @@ require_once __DIR__ . '/../services/AuthService.php';
 require_once __DIR__ . '/../services/EmailService.php';
 require_once __DIR__ . '/../../vendor/autoload.php';
 require_once __DIR__ . '/../services/SchedulingService.php';
+require_once __DIR__ . '/../services/LockServices.php';
 
 // Make sure to install PhpSpreadsheet via Composer
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
@@ -31,6 +32,44 @@ class ChairController
     private $authService;
     private $baseUrl;
     private $emailService;
+
+    public function isSystemLocked()
+    {
+        $lockService = new LockService();
+        return $lockService->isSystemLocked();
+        try {
+            $stmt = $this->db->prepare("
+                SELECT is_locked FROM system_locks ORDER BY lock_id DESC LIMIT 1
+            ");
+            $stmt->execute();
+            $result = $stmt->fetchColumn();
+            return $result ? (bool)$result : false;
+        } catch (PDOException $e) {
+            error_log("isSystemLocked: Database error - " . $e->getMessage());
+            return false;
+        }
+    }
+
+    public function requestUnlock()
+    {
+        if ($_SERVER['REQUEST_METHOD'] !== 'POST' || !$this->authService->verifyCsrfToken($_POST['csrf_token'] ?? '')) {
+            error_log("requestUnlock: Invalid request or CSRF token for user_id: " . ($_SESSION['user_id'] ?? 'unknown'));
+            header('Location: /chair/dashboard');
+            exit;
+        }
+
+        try {
+            $message = trim($_POST['message'] ?? '');
+            $lockService = new LockService();
+            $lockService->submitUnlockRequest($_SESSION['user_id'], $message);
+            header('Location: /chair/dashboard?message=Request submitted');
+            exit;
+        } catch (PDOException $e) {
+            error_log("requestUnlock: Database error - " . $e->getMessage());
+            header('Location: /chair/dashboard?error=Failed to submit request');
+            exit;
+        }
+    }
 
     public function __construct()
     {
@@ -109,10 +148,17 @@ class ChairController
         try {
             $chairId = $_SESSION['user_id'];
             error_log("dashboard: Starting dashboard method for user_id: $chairId");
-
+    
+            // Check if system is locked
+            $lockService = new LockService();
+            if ($this->isSystemLocked()) {
+                require_once __DIR__ . '/../views/chair/locked.php'; // Create this view
+                exit;
+            }
+    
             // Get department for the Chair
             $departmentId = $this->getChairDepartment($chairId);
-
+    
             if (!$departmentId) {
                 error_log("dashboard: No department found for chairId: $chairId");
                 $error = "No department assigned to this chair. Please contact the administrator.";
@@ -128,19 +174,19 @@ class ChairController
                 require_once $viewPath;
                 return;
             }
-
+    
             error_log("dashboard: Department fetched - department_id: $departmentId");
-
+    
             // Get department name
             $deptStmt = $this->db->prepare("SELECT department_name FROM departments WHERE department_id = :department_id");
             $deptStmt->execute([':department_id' => $departmentId]);
             $departmentName = $deptStmt->fetchColumn();
-
+    
             // Get current semester
             $currentSemesterStmt = $this->db->query("SELECT semester_name, academic_year FROM semesters WHERE is_current = 1 LIMIT 1");
             $currentSemester = $currentSemesterStmt->fetch(PDO::FETCH_ASSOC);
             $semesterInfo = $currentSemester ? "{$currentSemester['semester_name']} {$currentSemester['academic_year']}" : '2nd Semester 2024-2025';
-
+    
             // Get counts for dashboard
             $schedulesCount = $this->db->query("SELECT COUNT(*) FROM schedules s 
                                                 JOIN courses c ON s.course_id = c.course_id 
@@ -149,9 +195,9 @@ class ChairController
                                              JOIN users u ON f.user_id = u.user_id 
                                              WHERE u.department_id = " . (int)$departmentId)->fetchColumn();
             $coursesCount = $this->db->query("SELECT COUNT(*) FROM courses WHERE department_id = " . (int)$departmentId)->fetchColumn();
-
+    
             error_log("dashboard: Counts - schedules: $schedulesCount, faculty: $facultyCount, courses: $coursesCount");
-
+    
             // Get curricula with active status
             $curriculaStmt = $this->db->prepare("
                 SELECT c.curriculum_id, c.curriculum_name, c.total_units, c.status, p.program_name 
@@ -162,9 +208,9 @@ class ChairController
             ");
             $curriculaStmt->execute([':department_id' => $departmentId]);
             $curricula = $curriculaStmt->fetchAll(PDO::FETCH_ASSOC);
-
+    
             error_log("dashboard: Fetched " . count($curricula) . " curricula");
-
+    
             // Get recent schedules
             $recentSchedulesStmt = $this->db->prepare("
                 SELECT s.schedule_id, c.course_code, CONCAT(u.first_name, ' ', u.last_name) AS faculty_name, 
@@ -180,9 +226,9 @@ class ChairController
             ");
             $recentSchedulesStmt->execute([':department_id' => $departmentId]);
             $recentSchedules = $recentSchedulesStmt->fetchAll(PDO::FETCH_ASSOC);
-
+    
             error_log("dashboard: Fetched " . count($recentSchedules) . " recent schedules");
-
+    
             // Get schedule distribution data for chart
             $scheduleDistStmt = $this->db->prepare("
                 SELECT s.day_of_week, COUNT(*) as count 
@@ -193,16 +239,16 @@ class ChairController
             ");
             $scheduleDistStmt->execute([':department_id' => $departmentId]);
             $scheduleDistData = $scheduleDistStmt->fetchAll(PDO::FETCH_ASSOC);
-
+    
             $days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
             $scheduleDist = array_fill_keys($days, 0);
             foreach ($scheduleDistData as $row) {
                 $scheduleDist[$row['day_of_week']] = (int)$row['count'];
             }
             $scheduleDistJson = json_encode(array_values($scheduleDist));
-
+    
             error_log("dashboard: Schedule distribution - " . $scheduleDistJson);
-
+    
             // Get faculty workload data for chart
             $workloadStmt = $this->db->prepare("
                 SELECT CONCAT(u.first_name, ' ', u.last_name) AS faculty_name, COUNT(s.schedule_id) as course_count
@@ -217,25 +263,25 @@ class ChairController
             ");
             $workloadStmt->execute([':department_id' => $departmentId]);
             $workloadData = $workloadStmt->fetchAll(PDO::FETCH_ASSOC);
-
+    
             $workloadLabels = array_column($workloadData, 'faculty_name');
             $workloadCounts = array_column($workloadData, 'course_count');
             $workloadLabelsJson = json_encode($workloadLabels);
             $workloadCountsJson = json_encode($workloadCounts);
-
+    
             error_log("dashboard: Faculty workload - labels: " . $workloadLabelsJson . ", counts: " . $workloadCountsJson);
-
+    
             $viewPath = __DIR__ . '/../views/chair/dashboard.php';
             error_log("dashboard: Looking for view at: $viewPath");
             error_log("dashboard: File exists: " . (file_exists($viewPath) ? 'YES' : 'NO'));
-
+    
             if (!file_exists($viewPath)) {
                 error_log("dashboard: View file not found at: $viewPath");
                 http_response_code(404);
                 echo "404 Not Found: Dashboard view missing";
                 exit;
             }
-
+    
             require_once $viewPath;
         } catch (Exception $e) {
             error_log("dashboard: Full error: " . $e->getMessage());

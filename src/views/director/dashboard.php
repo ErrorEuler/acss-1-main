@@ -252,6 +252,41 @@ ob_start();
         .secondary-action-btn:hover .action-icon {
             transform: scale(1.1);
         }
+
+        .lock-toggle-btn {
+            background: var(--bg-gradient);
+            color: white;
+            border: none;
+            padding: 14px 28px;
+            border-radius: 12px;
+            font-weight: 600;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            box-shadow: 0 4px 6px -1px rgba(37, 99, 235, 0.3);
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        .lock-toggle-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 15px rgba(37, 99, 235, 0.4);
+            background: linear-gradient(135deg, var(--primary-dark) 0%, var(--primary-yellow) 100%);
+        }
+        .lock-toggle-btn.locked {
+            background: linear-gradient(135deg, #ef4444, #dc2626);
+        }
+        .lock-toggle-btn.locked:hover {
+            background: linear-gradient(135deg, #dc2626, #b91c1c);
+        }
+
+        .lock-status-banner {
+            background: linear-gradient(135deg, #ef4444, #dc2626);
+            color: white;
+            padding: 1rem;
+            border-radius: 8px;
+            margin-bottom: 1.5rem;
+            text-align: center;
+            font-weight: 500;
+        }
     </style>
 </head>
 
@@ -298,6 +333,14 @@ ob_start();
                 </div>
             </div>
         </div>
+
+        <!-- Lock Status Banner (if system is locked) -->
+        <?php if ($data['is_locked']): ?>
+            <div class="lock-status-banner">
+                <i class="fas fa-lock mr-2"></i> System Locked for Others - You can still manage unlock requests and unlock the system.
+            </div>
+        <?php endif; ?>
+
 
         <!-- Stats Cards Grid -->
         <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6 mb-8">
@@ -380,6 +423,49 @@ ob_start();
                 </div>
             </div>
         <?php endif; ?>
+
+        <!-- Lock Toggle and Unlock Requests -->
+        <div class="content-section mb-8">
+            <div class="section-header">
+                <div class="flex flex-col lg:flex-row justify-between items-start lg:items-center">
+                    <div class="mb-4 lg:mb-0">
+                        <h2 class="text-2xl font-bold text-gray-900 mb-2 flex items-center">
+                            <i class="fas fa-lock text-yellow-600 mr-3"></i>
+                            System Lock Control
+                        </h2>
+                        <p class="text-gray-600">Manually lock/unlock the system for Chair, Faculty, and Dean</p>
+                    </div>
+                </div>
+            </div>
+            <div class="p-6">
+                <form method="POST" class="mb-6">
+                    <input type="hidden" name="action" value="toggle_lock">
+                    <button type="submit" class="lock-toggle-btn <?php echo $data['is_locked'] ? 'locked' : ''; ?>">
+                        <i class="fas fa-<?php echo $data['is_locked'] ? 'unlock' : 'lock'; ?> action-icon"></i>
+                        <span><?php echo $data['is_locked'] ? 'Unlock System' : 'Lock System'; ?></span>
+                    </button>
+                </form>
+
+                <div class="mt-6">
+                    <h3 class="text-lg font-semibold text-gray-900 mb-4">Pending Unlock Requests</h3>
+                    <?php if (!empty($data['unlock_requests'])): ?>
+                        <h2>Unlock Requests</h2>
+                        <?php foreach ($data['unlock_requests'] as $request): ?>
+                            <div>
+                                <p>Request from <?php echo htmlspecialchars($request['first_name'] . ' ' . $request['last_name']); ?> at <?php echo htmlspecialchars($request['created_at']); ?></p>
+                                <form method="POST">
+                                    <input type="hidden" name="action" value="approve_request">
+                                    <input type="hidden" name="request_id" value="<?php echo htmlspecialchars($request['request_id']); ?>">
+                                    <button type="submit">Approve</button>
+                                </form>
+                            </div>
+                        <?php endforeach; ?>
+                    <?php else: ?>
+                        <p class="text-gray-600">No pending requests.</p>
+                    <?php endif; ?>
+                </div>
+            </div>
+        </div>
 
         <!-- My Current Schedule Section -->
         <div class="content-section mb-8">
@@ -486,8 +572,8 @@ ob_start();
         <div class="mt-8 text-center">
             <div class="inline-flex items-center space-x-4 bg-white rounded-full px-6 py-3 shadow-sm border">
                 <div class="flex items-center space-x-2">
-                    <div class="w-2 h-2 <?php echo ($data['has_db_error']) ? 'bg-red-400' : 'bg-green-400'; ?> rounded-full animate-pulse"></div>
-                    <span class="text-sm text-gray-600"><?php echo ($data['has_db_error']) ? 'System Issues' : 'System Online'; ?></span>
+                    <div class="w-2 h-2 <?php echo ($data['has_db_error'] || $data['is_locked']) ? 'bg-red-400' : 'bg-green-400'; ?> rounded-full animate-pulse"></div>
+                    <span class="text-sm text-gray-600"><?php echo ($data['has_db_error'] || $data['is_locked']) ? 'System Locked' : 'System Online'; ?></span>
                 </div>
                 <div class="text-sm text-gray-500">
                     Welcome, <?php echo htmlspecialchars($_SESSION['first_name'] ?? $data['user']['first_name'] ?? 'Director'); ?>
@@ -575,6 +661,41 @@ ob_start();
             `;
             document.head.appendChild(style);
         });
+
+
+        function loadUnlockRequests() {
+        fetch('/director/get_unlock_requests', { method: 'GET' }) // Add a new endpoint in DirectorController
+            .then(response => response.json())
+            .then(data => {
+                const requestsContainer = document.getElementById('unlock-requests-container'); // Add this ID to the div
+                requestsContainer.innerHTML = '';
+                if (data.length === 0) {
+                    requestsContainer.innerHTML = '<p class="text-gray-600">No pending requests.</p>';
+                } else {
+                    data.forEach(request => {
+                        requestsContainer.innerHTML += `
+                            <div class="mb-4 p-4 border rounded-lg bg-white shadow-sm">
+                                <p class="text-sm font-medium text-gray-900">Request by ${request.first_name} ${request.last_name} at ${request.created_at}</p>
+                                <p class="text-sm text-gray-600">Message: ${request.message || 'No message'}</p>
+                                <form method="POST" class="mt-2">
+                                    <input type="hidden" name="action" value="approve_request">
+                                    <input type="hidden" name="request_id" value="${request.request_id}">
+                                    <button type="submit" class="px-4 py-2 bg-green-500 text-white rounded hover:bg-green-600">Approve</button>
+                                </form>
+                            </div>
+                        `;
+                    });
+                }
+            });
+    }
+
+    // Poll every 10 seconds
+    setInterval(loadUnlockRequests, 10000);
+    loadUnlockRequests(); // Initial load
+
+
+
+
     </script>
 </body>
 

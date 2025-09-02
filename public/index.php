@@ -124,6 +124,10 @@ function handleDirectorRoutes($path)
             error_log("Routing to DirectorController::setSchedule");
             $controller->setScheduleDeadline();
             break;
+            case '/director/get_unlock_requests': // Add this case
+                $controller = new DirectorController();
+                $controller->getUnlockRequestsJson();
+                break;
         case '/director/logout':
             error_log("Routing to AuthController::logout");
             require_once __DIR__ . '/../src/controllers/AuthController.php';

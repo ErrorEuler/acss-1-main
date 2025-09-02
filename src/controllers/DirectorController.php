@@ -3,6 +3,7 @@ require_once __DIR__ . '/../config/Database.php';
 require_once __DIR__ . '/../models/UserModel.php';
 require_once __DIR__ . '/../services/AuthService.php';
 require_once __DIR__ . '/../controllers/ApiController.php';
+require_once __DIR__ . '/../services/LockServices.php';
 
 class DirectorController
 {
@@ -48,7 +49,6 @@ class DirectorController
             $stmt->execute([':user_id' => $_SESSION['user_id']]);
             $user = $stmt->fetch(PDO::FETCH_ASSOC);
             if ($user) {
-                // Fetch primary specialization for the director
                 $specStmt = $this->db->prepare("
                     SELECT s.specialization_id, c.course_name
                     FROM specializations s
@@ -72,10 +72,24 @@ class DirectorController
         }
     }
 
-    public function dashboard()
+    public function getUnlockRequestsJson()
+{
+    $lockService = new LockService();
+    $requests = $this->getUnlockRequests();
+    header('Content-Type: application/json');
+    echo json_encode($requests);
+    exit;
+}
+
+private function getUnlockRequests()
+    {
+        $lockService = new LockService();
+        return $lockService->getUnlockRequests();
+    }
+
+public function dashboard()
     {
         try {
-            // Fetch user data
             $userData = $this->getUserData();
             if (!$userData) {
                 error_log("dashboard: Failed to load user data for user_id: " . ($_SESSION['user_id'] ?? 'unknown'));
@@ -83,7 +97,6 @@ class DirectorController
                 exit;
             }
 
-            // Fetch department and curriculum data
             $departmentId = $this->getDepartmentId($userData['user_id']);
             if ($departmentId === null) {
                 error_log("dashboard: No department found for user_id: " . $userData['user_id']);
@@ -91,20 +104,32 @@ class DirectorController
                 exit;
             }
 
-            // Fetch current semester
             $semester = $this->getCurrentSemester();
-
-            // Fetch pending approvals
             $pendingCount = $this->getPendingApprovalsCount($departmentId);
-
-            // Fetch schedule deadline
             $deadline = $this->getScheduleDeadline($departmentId);
-
-            // Fetch class schedules
             $facultyId = $this->getFacultyId($userData['user_id']);
             $schedules = $facultyId ? $this->getSchedules($facultyId) : [];
 
-            // Prepare data for view
+            $lockService = new LockService();
+            $isLocked = $lockService->isSystemLocked();
+
+            if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
+                if ($_POST['action'] === 'toggle_lock') {
+                    $lockService->toggleSystemLock(!$isLocked);
+                    header('Location: /director/dashboard');
+                    exit;
+                } elseif ($_POST['action'] === 'approve_request') {
+                    $requestId = $_POST['request_id'] ?? null;
+                    if ($requestId) {
+                        $lockService->approveUnlockRequest($requestId);
+                    }
+                    header('Location: /director/dashboard');
+                    exit;
+                }
+            }
+
+            $unlockRequests = $lockService->getUnlockRequests();
+
             $data = [
                 'user' => $userData,
                 'pending_approvals' => $pendingCount,
@@ -112,11 +137,15 @@ class DirectorController
                 'semester' => $semester,
                 'schedules' => $schedules,
                 'title' => 'Director Dashboard',
-                'current_time' => date('h:i A T', time()), // e.g., 09:57 PM PST on Aug 24, 2025
-                'has_db_error' => $departmentId === null || $pendingCount === null || $deadline === null || empty($schedules)
+                'current_time' => date('h:i A T', time()),
+                'has_db_error' => $departmentId === null || $pendingCount === null || $deadline === null || empty($schedules),
+                'is_locked' => $isLocked,
+                'unlock_requests' => $unlockRequests
             ];
 
+            error_log("dashboard: View loaded for user_id: " . $_SESSION['user_id']);
             require_once __DIR__ . '/../views/director/dashboard.php';
+            exit;
         } catch (PDOException $e) {
             error_log("dashboard: Database error - " . $e->getMessage());
             http_response_code(500);
@@ -128,15 +157,73 @@ class DirectorController
         }
     }
 
-    // Helper methods to encapsulate database queries
+    private function toggleSystemLock($lock)
+    {
+        try {
+            $userId = $_SESSION['user_id'] ?? null;
+            if ($userId === null || !is_numeric($userId)) {
+                error_log("toggleSystemLock: Invalid or missing user_id: " . ($userId ?? 'null'));
+                return;
+            }
+    
+            $stmt = $this->db->prepare("
+                INSERT INTO system_locks (is_locked, locked_by)
+                VALUES (:is_locked, :locked_by)
+                ON DUPLICATE KEY UPDATE is_locked = VALUES(is_locked), locked_at = NOW(), unlocked_at = NULL
+            ");
+            error_log("toggleSystemLock: Prepared query - " . $stmt->queryString);
+            $params = [
+                ':is_locked' => $lock ? 1 : 0,
+                ':locked_by' => (int)$userId
+            ];
+            error_log("toggleSystemLock: Parameters - " . print_r($params, true));
+            $stmt->execute($params);
+            error_log("toggleSystemLock: System lock set to " . ($lock ? 'locked' : 'unlocked') . " by user_id: $userId");
+        } catch (PDOException $e) {
+            error_log("toggleSystemLock: Database error - " . $e->getMessage());
+        }
+    }
+
+    public function isSystemLocked() // Changed from private to public
+    {
+        try {
+            $stmt = $this->db->prepare("
+                SELECT is_locked FROM system_locks ORDER BY lock_id DESC LIMIT 1
+            ");
+            $stmt->execute();
+            $result = $stmt->fetchColumn();
+            return $result ? (bool)$result : false;
+        } catch (PDOException $e) {
+            error_log("isSystemLocked: Database error - " . $e->getMessage());
+            return false;
+        }
+    }
+
+
+
+    private function approveUnlockRequest($requestId)
+    {
+        try {
+            $this->db->beginTransaction();
+            $stmt = $this->db->prepare("UPDATE unlock_requests SET status = 'approved' WHERE request_id = :request_id");
+            $stmt->execute([':request_id' => $requestId]);
+            $this->toggleSystemLock(false); // Unlock system
+            $this->db->commit();
+            error_log("approveUnlockRequest: Approved request $requestId");
+        } catch (PDOException $e) {
+            $this->db->rollBack();
+            error_log("approveUnlockRequest: Database error - " . $e->getMessage());
+        }
+    }
+
     private function getDepartmentId($userId)
     {
         try {
             $stmt = $this->db->prepare("
-            SELECT department_id 
-            FROM department_instructors 
-            WHERE user_id = :user_id AND is_current = 1
-        ");
+                SELECT department_id 
+                FROM department_instructors 
+                WHERE user_id = :user_id AND is_current = 1
+            ");
             $stmt->execute([':user_id' => $userId]);
             $department = $stmt->fetch(PDO::FETCH_ASSOC);
             return $department ? $department['department_id'] : null;
@@ -163,10 +250,11 @@ class DirectorController
     {
         try {
             $stmt = $this->db->prepare("
-            SELECT COUNT(*) as pending_count
-            FROM curriculum_approvals
-            WHERE department_id = :department_id AND status = 'pending'
-        ");
+                SELECT COUNT(*) as pending_count
+                FROM curriculum_approvals ca
+                JOIN curricula c ON ca.curriculum_id = c.curriculum_id
+                WHERE c.department_id = :department_id AND ca.status = 'pending'
+            ");
             $stmt->execute([':department_id' => $departmentId]);
             return $stmt->fetchColumn() ?: 0;
         } catch (PDOException $e) {
@@ -179,11 +267,11 @@ class DirectorController
     {
         try {
             $stmt = $this->db->prepare("
-            SELECT deadline 
-            FROM schedule_deadlines 
-            WHERE department_id = :department_id 
-            ORDER BY deadline DESC LIMIT 1
-        ");
+                SELECT deadline 
+                FROM schedule_deadlines 
+                WHERE department_id = :department_id 
+                ORDER BY deadline DESC LIMIT 1
+            ");
             $stmt->execute([':department_id' => $departmentId]);
             return $stmt->fetchColumn();
         } catch (PDOException $e) {
@@ -209,14 +297,14 @@ class DirectorController
     {
         try {
             $stmt = $this->db->prepare("
-            SELECT s.*, c.course_code, c.course_name, r.room_name, se.semester_name, se.academic_year
-            FROM schedules s
-            JOIN courses c ON s.course_id = c.course_id
-            LEFT JOIN classrooms r ON s.room_id = r.room_id
-            JOIN semesters se ON s.semester_id = se.semester_id
-            WHERE s.faculty_id = :faculty_id AND se.is_current = 1
-            ORDER BY s.day_of_week, s.start_time
-        ");
+                SELECT s.*, c.course_code, c.course_name, r.room_name, se.semester_name, se.academic_year
+                FROM schedules s
+                JOIN courses c ON s.course_id = c.course_id
+                LEFT JOIN classrooms r ON s.room_id = r.room_id
+                JOIN semesters se ON s.semester_id = se.semester_id
+                WHERE s.faculty_id = :faculty_id AND se.is_current = 1
+                ORDER BY s.day_of_week, s.start_time
+            ");
             $stmt->execute([':faculty_id' => $facultyId]);
             return $stmt->fetchAll(PDO::FETCH_ASSOC);
         } catch (PDOException $e) {
@@ -235,7 +323,6 @@ class DirectorController
                 exit;
             }
 
-            // Fetch department_id from department_instructors
             $stmt = $this->db->prepare("
                 SELECT department_id FROM department_instructors 
                 WHERE user_id = :user_id AND is_current = 1
@@ -250,7 +337,7 @@ class DirectorController
             $departmentId = $department['department_id'];
 
             if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-                $deadline = filter_input(INPUT_POST, 'deadline', FILTER_SANITIZE_STRING);
+                $deadline = trim($_POST['deadline'] ?? '');
                 if (!$deadline) {
                     error_log("setScheduleDeadline: Invalid deadline format");
                     $_SESSION['error'] = 'Please provide a valid deadline date and time.';
@@ -266,7 +353,6 @@ class DirectorController
                     exit;
                 }
 
-                // Insert or update schedule deadline
                 $stmt = $this->db->prepare("
                     INSERT INTO schedule_deadlines (department_id, deadline, created_at)
                     VALUES (:department_id, :deadline, NOW())
@@ -283,7 +369,6 @@ class DirectorController
                 exit;
             }
 
-            // Fetch current deadline
             $deadlineStmt = $this->db->prepare("
                 SELECT deadline FROM schedule_deadlines 
                 WHERE department_id = :department_id 
@@ -329,7 +414,6 @@ class DirectorController
             }
             $departmentId = $department['department_id'];
 
-            // Fetch activity log for the department
             $activityStmt = $this->db->prepare("
                 SELECT al.log_id, al.action_type, al.action_description, al.created_at, u.first_name, u.last_name
                 FROM activity_logs al
@@ -367,14 +451,13 @@ class DirectorController
             $csrfToken = $this->authService->generateCsrfToken();
 
             if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-                error_log("profile: Received POST data - " . print_r($_POST, true)); // Debug log
+                error_log("profile: Received POST data - " . print_r($_POST, true));
                 if (!$this->authService->verifyCsrfToken($_POST['csrf_token'] ?? '')) {
                     $_SESSION['flash'] = ['type' => 'error', 'message' => 'Invalid CSRF token'];
                     header('Location: /director/profile');
                     exit;
                 }
 
-                // Map POST data to correct field names
                 $data = [
                     'email' => trim($_POST['email'] ?? ''),
                     'phone' => trim($_POST['phone'] ?? ''),
@@ -386,7 +469,7 @@ class DirectorController
                     'academic_rank' => trim($_POST['academic_rank'] ?? ''),
                     'employment_type' => trim($_POST['employment_type'] ?? ''),
                     'classification' => trim($_POST['classification'] ?? ''),
-                    'expertise_level' => trim($_POST['expertise_level'] ?? 'Intermediate'), // Default to Intermediate
+                    'expertise_level' => trim($_POST['expertise_level'] ?? 'Intermediate'),
                 ];
 
                 $errors = [];
@@ -413,7 +496,6 @@ class DirectorController
                     $this->db->beginTransaction();
 
                     try {
-                        // Update users table with dynamic fields
                         $setClause = [];
                         $params = [':user_id' => $userId];
                         $validFields = ['email', 'phone', 'first_name', 'middle_name', 'last_name', 'suffix', 'title'];
@@ -435,7 +517,6 @@ class DirectorController
                             $userStmt->execute($params);
                         }
 
-                        // Update faculty table with dynamic fields
                         $facultyStmt = $this->db->prepare("SELECT faculty_id FROM faculty WHERE user_id = :user_id");
                         $facultyStmt->execute([':user_id' => $userId]);
                         $facultyId = $facultyStmt->fetchColumn();
@@ -458,7 +539,6 @@ class DirectorController
                             }
                         }
 
-                        // Update specialization (handle course_specialization as course name)
                         $courseSpecialization = trim($_POST['course_specialization'] ?? '');
                         if ($courseSpecialization) {
                             $courseStmt = $this->db->prepare("SELECT course_id FROM courses WHERE course_name = :course_name");
@@ -488,7 +568,6 @@ class DirectorController
                                     $insertSpecStmt->execute([':faculty_id' => $facultyId, ':course_id' => $courseId, ':expertise_level' => $data['expertise_level']]);
                                 }
 
-                                // Reset other specializations to non-primary
                                 $resetStmt = $this->db->prepare("
                                     UPDATE specializations 
                                     SET is_primary_specialization = 0 
@@ -520,7 +599,6 @@ class DirectorController
                 exit;
             }
 
-            // Fetch user data and stats
             $stmt = $this->db->prepare("
                 SELECT u.*, d.department_name, c.college_name, r.role_name,
                        f.academic_rank, f.employment_type, f.classification,
@@ -543,7 +621,6 @@ class DirectorController
                 throw new Exception('User not found.');
             }
 
-            // Fetch specializations
             $specStmt = $this->db->prepare("
                 SELECT s.*, c.course_name 
                 FROM specializations s
@@ -554,7 +631,6 @@ class DirectorController
             $specStmt->execute([':user_id' => $userId]);
             $specializations = $specStmt->fetchAll(PDO::FETCH_ASSOC);
 
-            // Extract stats
             $facultyCount = $user['facultyCount'] ?? 0;
             $coursesCount = $user['coursesCount'] ?? 0;
             $pendingApplicantsCount = $user['pendingApplicantsCount'] ?? 0;
@@ -582,7 +658,7 @@ class DirectorController
 
         $file = $_FILES['profile_picture'];
         $allowedTypes = ['image/jpeg', 'image/png', 'image/gif'];
-        $maxSize = 2 * 1024 * 1024; // 2MB
+        $maxSize = 2 * 1024 * 1024;
 
         if (!in_array($file['type'], $allowedTypes)) {
             error_log("profile: Invalid file type for user_id: $userId - " . $file['type']);
@@ -596,7 +672,7 @@ class DirectorController
 
         $ext = pathinfo($file['name'], PATHINFO_EXTENSION);
         $filename = "profile_{$userId}_" . time() . ".{$ext}";
-        $uploadDir = $_SERVER['DOCUMENT_ROOT'] . '/uploads/profile_pictures/'; // Public-accessible path
+        $uploadDir = $_SERVER['DOCUMENT_ROOT'] . '/uploads/profile_pictures/';
         $uploadPath = $uploadDir . $filename;
 
         if (!is_dir($uploadDir)) {
@@ -606,7 +682,6 @@ class DirectorController
             }
         }
 
-        // Remove existing profile picture
         $stmt = $this->db->prepare("SELECT profile_picture FROM users WHERE user_id = :user_id");
         $stmt->execute([':user_id' => $userId]);
         $currentPicture = $stmt->fetchColumn();
